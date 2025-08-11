@@ -1,0 +1,140 @@
+import os
+import subprocess
+import csv
+import snowflake.connector
+from dotenv import load_dotenv
+
+# Load .env
+load_dotenv()
+
+# Config
+SA_PASSWORD = os.getenv("SA_PASSWORD")
+BAK_FILE = os.getenv("BAK_FILE")
+DB_NAME = os.getenv("DB_NAME")
+
+SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE")
+SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE")
+SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA")
+SNOWFLAKE_ROLE = os.getenv("SNOWFLAKE_ROLE")
+STAGE_NAME = os.getenv("STAGE_NAME")
+FILE_FORMAT = os.getenv("FILE_FORMAT")
+
+CSV_DIR = "CSVs"
+os.makedirs(CSV_DIR, exist_ok=True)
+
+CONTAINER_NAME = "sqlserver"
+SQLCMD_PATH = "/opt/mssql-tools/bin/sqlcmd"
+
+def ensure_container_running():
+    result = subprocess.run(["docker", "ps", "-f", f"name={CONTAINER_NAME}", "--format", "{{.Names}}"],
+                            capture_output=True, text=True)
+    if CONTAINER_NAME not in result.stdout:
+        raise RuntimeError(f"❌ SQL Server container '{CONTAINER_NAME}' is not running.")
+    print("✅ SQL Server container is running.")
+
+def run_sqlcmd(sql):
+    subprocess.run([
+        "docker", "exec", "-i", CONTAINER_NAME,
+        SQLCMD_PATH, "-S", "localhost", "-U", "SA", "-P", SA_PASSWORD,
+        "-Q", sql
+    ], check=True)
+
+def run_sqlcmd_fetchall(sql):
+    result = subprocess.run([
+        "docker", "exec", "-i", CONTAINER_NAME,
+        SQLCMD_PATH, "-S", "localhost", "-U", "SA", "-P", SA_PASSWORD,
+        "-Q", sql, "-s", "\t", "-W"
+    ], capture_output=True, text=True, check=True)
+    return list(csv.reader(result.stdout.strip().splitlines(), delimiter="\t"))
+
+def restore_database():
+    print(f"🔁 Restoring {BAK_FILE} into database '{DB_NAME}'...")
+    query = f"RESTORE FILELISTONLY FROM DISK = '/var/opt/mssql/backup/{BAK_FILE}';"
+    rows = run_sqlcmd_fetchall(query)
+    if len(rows) < 2:
+        raise RuntimeError("❌ Could not detect logical names from .bak.")
+    logical_data = rows[0][0]
+    logical_log = rows[1][0]
+
+    restore_sql = f"""
+    IF DB_ID('{DB_NAME}') IS NOT NULL
+        ALTER DATABASE [{DB_NAME}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    RESTORE DATABASE [{DB_NAME}]
+    FROM DISK = '/var/opt/mssql/backup/{BAK_FILE}'
+    WITH MOVE '{logical_data}' TO '/var/opt/mssql/data/{DB_NAME}.mdf',
+         MOVE '{logical_log}' TO '/var/opt/mssql/data/{DB_NAME}_log.ldf',
+         REPLACE;
+    ALTER DATABASE [{DB_NAME}] SET MULTI_USER;
+    """
+    run_sqlcmd(restore_sql)
+    print("✅ Database restored.")
+
+def export_tables_to_csv():
+    print("📤 Exporting tables to CSV...")
+    tables_raw = run_sqlcmd_fetchall(f"USE [{DB_NAME}]; SELECT name FROM sys.tables;")
+    tables = [row[0].strip() for row in tables_raw if row and not row[0].startswith("name")]
+
+    for table in tables:
+        csv_file = os.path.join(CSV_DIR, f"{table}.csv")
+        query = f"SELECT * FROM [{DB_NAME}].dbo.[{table}]"
+        cmd = [
+            "docker", "exec", "-i", CONTAINER_NAME,
+            SQLCMD_PATH, "-S", "localhost", "-U", "SA", "-P", SA_PASSWORD,
+            "-d", DB_NAME, "-Q", query,
+            "-s", ",",    # comma separator
+            "-W",         # trim trailing spaces
+            "-h", "1"     # KEEP headers but REMOVE dashed line
+        ]
+        with open(csv_file, "w") as f:
+            subprocess.run(cmd, stdout=f, check=True)
+        print(f"✅ Exported: {csv_file}")
+
+def upload_to_snowflake():
+    print("❄️ Uploading CSVs to Snowflake...")
+    conn = snowflake.connector.connect(
+        account = SNOWFLAKE_ACCOUNT,
+        user = SNOWFLAKE_USER,
+        authenticator = "externalbrowser",
+        role = "BUSINESS_ANALYST",
+        warehouse = "AD_HOC_WH",
+        database = "ANALYTICS",
+        schema = "BISTRACK",
+    )
+    cur = conn.cursor()
+
+    for file in os.listdir(CSV_DIR):
+        if file.endswith(".csv"):
+            table = file.replace(".csv", "")
+            csv_path = os.path.join(CSV_DIR, file)
+
+            print(f"🔼 Uploading {file} to Snowflake stage…")
+            cur.execute(f"PUT file://{os.path.abspath(csv_path)} @{STAGE_NAME} AUTO_COMPRESS=TRUE")
+
+            print(f"🧪 Creating table {table} if it doesn’t exist…")
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} USING TEMPLATE (
+                    SELECT * FROM CSV_SCAN(@{STAGE_NAME}, FILE_FORMAT => '{FILE_FORMAT}', PATTERN => '{file}.gz', LIMIT => 1)
+                );
+            """)
+
+            print(f"📥 Inserting data into {table}…")
+            cur.execute(f"""
+                COPY INTO {table}
+                FROM @{STAGE_NAME}/{file}.gz
+                FILE_FORMAT = (FORMAT_NAME = {FILE_FORMAT})
+                ON_ERROR = 'CONTINUE';
+            """)
+            print(f"✅ Finished: {file} → {table}")
+
+    cur.close()
+    conn.close()
+
+
+if __name__ == "__main__":
+    ensure_container_running()
+    restore_database()
+    export_tables_to_csv()
+    upload_to_snowflake()
+    print("🎉 All done!")
